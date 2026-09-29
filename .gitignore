@@ -1,0 +1,7 @@
+runs/
+data/*.parquet
+data/bpe*/
+__pycache__/
+scratch_*.py
+queue*.txt
+queue*.log

@@ -223,7 +223,11 @@ class PointerXL(nn.Module):
 
     def num_params(self, non_embedding=True):
         n = sum(p.numel() for p in self.parameters())
-        return n - self.wte.weight.numel() if non_embedding else n
+        if non_embedding:
+            n -= self.wte.weight.numel()
+            if self.cfg.compo_buckets:
+                n -= self.compo.weight.numel()
+        return n
 
     # ---------------------------------------------------------------- forward
     def forward(self, idx, y, mk, mv, n_mem, pk, py, n_ptr, reduction="mean"):
@@ -251,8 +255,8 @@ class PointerXL(nn.Module):
             if c.unet and i < L // 2:
                 skips.append(x)
             if M:
-                new_k.append(torch.cat([mk[i], k.detach()], dim=2)[:, :, -M:])
-                new_v.append(torch.cat([mv[i], v.detach()], dim=2)[:, :, -M:])
+                new_k.append(torch.cat([mk[i], k.detach()], dim=2)[:, :, -M:].contiguous())
+                new_v.append(torch.cat([mv[i], v.detach()], dim=2)[:, :, -M:].contiguous())
         h = self.nf(x)
         z = F.linear(h * (self.logit_temp.exp() / math.sqrt(c.d_model)), E)
         if c.softcap > 0:
@@ -276,8 +280,8 @@ class PointerXL(nn.Module):
             match = (Yc[:, None, :] == y[:, :, None]) & ok[None]
             lp_ptr = torch.logsumexp(la[..., :-1].masked_fill(~match, float("-inf")), dim=-1)
             nll = -torch.logaddexp(la[..., -1] - nll_v, lp_ptr)
-            new_pk = Kc.detach()[:, -P:]
-            new_py = Yc[:, -P:]
+            new_pk = Kc.detach()[:, -P:].contiguous()
+            new_py = Yc[:, -P:].contiguous()
         if reduction == "none":
             return nll, new_k, new_v, new_pk, new_py
         if reduction == "none_h":  # also expose final hidden states (kNN keys / queries)

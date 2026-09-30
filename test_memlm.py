@@ -62,3 +62,26 @@ with torch.no_grad():
             tot += torch.exp(-nll).item()
         assert abs(tot - 1) < 1e-4, (t, tot)
     print("normalisation OK (sum p = 1 at all positions)")
+
+with torch.no_grad():
+    # 3) reset() must be equivalent to a fresh init_state() (key_offset on, mem_len > seg)
+    cfg2 = MemConfig(vocab_size=V, n_layer=2, n_head=2, d_model=32, seg=8, mem_len=16, ptr_len=24, ptr_dim=8, max_pos=64)
+    m2 = PointerXL(cfg2).eval()
+    for p in m2.parameters():
+        p.add_(0.3 * torch.randn_like(p))
+    toks = torch.randint(0, V, (8 * 5 + 1,))
+
+    def score(st, lo, hi):
+        outs = []
+        for s in range(lo, hi, 8):
+            x, y = toks[s:s + 8][None], toks[s + 1:s + 9][None]
+            out = m2(x, y, st["mk"], st["mv"], st["n_mem"], st["pk"], st["py"], st["n_ptr"], "none")
+            outs.append(out[0][0])
+            st = m2.advance(st, out, 8)
+        return torch.cat(outs), st
+
+    _, st = score(m2.init_state(1), 0, 16)
+    a_, _ = score(m2.reset(st), 16, 32)
+    b_, _ = score(m2.init_state(1), 16, 32)
+    assert (a_ - b_).abs().max().item() == 0.0, (a_ - b_).abs().max()
+    print("reset == init_state OK")

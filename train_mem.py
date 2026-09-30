@@ -167,7 +167,7 @@ def main(argv=None):
 
     P(f"params: total={model.num_params(False)/1e6:.2f}M non-emb={model.num_params()/1e6:.2f}M "
       f"steps/epoch={sampler.spe}")
-    ema, swa, swa_n, step, elapsed0 = None, None, 0, 0, 0.0
+    ema, swa, swa_n, step, elapsed0, g_prev = None, None, 0, 0, 0.0, None
     ck_path = os.path.join(a.out, "ckpt.pt")
     if os.path.exists(ck_path):
         ck = torch.load(ck_path, weights_only=False)
@@ -175,6 +175,7 @@ def main(argv=None):
         for o, s in zip(opts, ck["opts"]):
             o.load_state_dict(s)
         ema, swa, swa_n, step, elapsed0 = ck["ema"], ck["swa"], ck["swa_n"], ck["step"], ck["elapsed"]
+        g_prev = ck.get("g_prev")
         sampler.load(ck["sampler"])
         g.set_state(ck["gen"])
         torch.set_rng_state(ck["rng"])
@@ -185,11 +186,10 @@ def main(argv=None):
         tmp = ck_path + ".tmp"
         torch.save({"model": model.state_dict(), "opts": [o.state_dict() for o in opts], "ema": ema, "swa": swa,
                     "swa_n": swa_n, "step": step, "elapsed": elapsed, "sampler": sampler.state(),
-                    "gen": g.get_state(), "rng": torch.get_rng_state(), "state": state}, tmp)
+                    "gen": g.get_state(), "rng": torch.get_rng_state(), "state": state, "g_prev": g_prev}, tmp)
         os.replace(tmp, ck_path)
 
     mg_params = [p for n_, p in model.named_parameters() if p.ndim == 2 and "wte" not in n_ and "compo" not in n_]
-    g_prev = None
     t0 = time.time() - elapsed0
     eval_time, last_ck = 0.0, time.time()
     tr_loss, n_log, tlast = 0.0, 0, time.time()

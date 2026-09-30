@@ -93,11 +93,12 @@ def dyn_eval(model, stream, seg, mem_len, ptr_len, lr=0.0, opt="adam", decay=0.0
         for p, mm in zip(ps, mult):
             groups.setdefault(mm, []).append(p)
         o = torch.optim.Adam([dict(params=v, lr=lr * mm) for mm, v in groups.items()], betas=(beta1, beta2))
-        if rms is not None:  # warm-start second moments from train gradient statistics
+        if rms is not None:  # warm-start second moments from TRAIN gradient statistics
+            s_ = float(int(1 / (1 - beta2)))  # bias-corrected so that v_hat = rms^2 exactly
             for p, r in zip(ps, rms):
-                o.state[p]["step"] = torch.tensor(float(int(1 / (1 - beta2))))
+                o.state[p]["step"] = torch.tensor(s_)
                 o.state[p]["exp_avg"] = torch.zeros_like(p)
-                o.state[p]["exp_avg_sq"] = (r * r).clone()
+                o.state[p]["exp_avg_sq"] = (r * r * (1 - beta2 ** s_)).clone()
     if adapt and opt == "rms":
         mean_rms = torch.stack([r.mean() for r in rms]).mean()
         denom = [r + eps * mean_rms for r in rms]

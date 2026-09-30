@@ -27,6 +27,15 @@ def split_stream(data, split, eos):
     return torch.cat([torch.tensor([eos]), torch.from_numpy(arr)])
 
 
+def token_bytes(data):
+    """Exact byte length of every token id: in byte-level BPE each character of a token string
+    stands for exactly one byte (GPT-2 bytes_to_unicode map)."""
+    from tokenizers import Tokenizer
+    tok = Tokenizer.from_file(os.path.join(data, "tokenizer.json"))
+    return torch.tensor([0 if tok.id_to_token(i) == "<|eos|>" else len(tok.id_to_token(i))
+                         for i in range(tok.get_vocab_size())])
+
+
 def select(model, which):
     named = list(model.named_parameters())
     if which == "all":
@@ -186,8 +195,11 @@ def main():
     nll, n = dyn_eval(model, stream, a.seg, mem_len, ptr_len, a.lr, a.opt, a.decay, a.beta1, a.beta2,
                       a.params, rms, a.eps, a.emb_lr_mult, a.max_targets, col)
     if a.save:
+        assert not a.max_targets, "--save requires a full-split run"
         np.save(a.save, torch.cat(col).numpy())
-    nbytes = meta[a.split]["bytes"] * (n / meta[a.split]["tokens"] if a.max_targets else 1.0)
+    nbytes = meta[a.split]["bytes"]
+    if n < meta[a.split]["tokens"]:  # exact byte count of the scored prefix
+        nbytes = int(token_bytes(data)[stream[1:n + 1]].sum())
     print("RESULT", json.dumps({"split": a.split, "bpb": nll / math.log(2) / nbytes, "loss": nll / n, "n": n,
                                 "seg": a.seg, "mem_len": mem_len, "ptr_len": ptr_len, "lr": a.lr, "opt": a.opt,
                                 "decay": a.decay, "params": a.params, "beta1": a.beta1, "beta2": a.beta2,

@@ -37,6 +37,7 @@ def main():
     a = ap.parse_args()
     meta = json.load(open(os.path.join(a.data, "meta.json")))
     V = np.stack([np.load(f) for f in a.val])
+    assert V.shape[1] == meta["validation"]["tokens"], ("partial validation arrays", V.shape)
     w = em(V)
     out = {"weights": w.tolist()}
     for i, f in enumerate(a.val):
@@ -44,6 +45,7 @@ def main():
     out["val_bpb_mix"] = mix_nll(V, w).sum() / math.log(2) / meta["validation"]["bytes"]
     if a.test:
         T = np.stack([np.load(f) for f in a.test])
+        assert T.shape[1] == meta["test"]["tokens"], ("partial test arrays", T.shape)
         for i, f in enumerate(a.test):
             out[f"test_bpb[{i}]"] = T[i].sum() / math.log(2) / meta["test"]["bytes"]
         out["test_bpb_mix"] = mix_nll(T, w).sum() / math.log(2) / meta["test"]["bytes"]

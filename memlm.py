@@ -50,6 +50,8 @@ class MemConfig:
     resid_dropout: float = 0.0
     type_dropout: float = 0.0
     ptr_aux: float = 0.0  # extra weight on the plain softmax CE (keeps the vocab head sharp)
+    compo_buckets: int = 0  # >0: add hashed char n-gram embeddings to every token row (tied in/out)
+    compo_ngrams: int = 32  # max n-grams per token (padded)
 
 
 class RotaryPos(nn.Module):
@@ -172,8 +174,39 @@ class PointerXL(nn.Module):
             if cfg.attn_gate:
                 nn.init.zeros_(b.attn.gate.weight)
                 nn.init.constant_(b.attn.gate.bias, 3.0)
-        if cfg.ptr_len:  # start mostly on the vocabulary softmax: sigmoid-ish sentinel preference
-            nn.init.constant_(self.ptr_sent.bias, 3.0)
+        if cfg.ptr_len:
+            # start on the vocabulary softmax: zero queries give uniform pointer scores, and the
+            # sentinel logit log(#candidates)+2 keeps ~90% of the mass on the softmax at init
+            nn.init.zeros_(self.ptr_q.weight)
+            nn.init.constant_(self.ptr_sent.bias, math.log(cfg.ptr_len + cfg.seg) + 2.0)
+        if cfg.compo_buckets:
+            K = cfg.compo_buckets
+            self.compo = nn.Embedding(K + 1, d, padding_idx=K)
+            nn.init.zeros_(self.compo.weight)
+            self.register_buffer("ng_idx", torch.full((cfg.vocab_size, cfg.compo_ngrams), K, dtype=torch.long))
+            self.register_buffer("ng_cnt", torch.ones(cfg.vocab_size))
+
+    def set_ngrams(self, token_strings, nmin=2, nmax=4):
+        """Hash character n-grams (with boundary markers) of each token string into buckets."""
+        import zlib
+        K, G = self.cfg.compo_buckets, self.cfg.compo_ngrams
+        idx = torch.full((len(token_strings), G), K, dtype=torch.long)
+        cnt = torch.ones(len(token_strings))
+        for v, s in enumerate(token_strings):
+            w = "<" + s + ">"
+            grams = sorted({w[i:i + n] for n in range(nmin, nmax + 1) for i in range(len(w) - n + 1)})[:G]
+            for j, gstr in enumerate(grams):
+                idx[v, j] = zlib.crc32(gstr.encode("utf-8")) % K
+            cnt[v] = max(1, len(grams))
+        self.ng_idx.copy_(idx)
+        self.ng_cnt.copy_(cnt)
+
+    def emb_table(self):
+        E = self.wte.weight
+        if self.cfg.compo_buckets:
+            K = self.cfg.compo_buckets
+            E = E + F.embedding_bag(self.ng_idx, self.compo.weight, mode="sum", padding_idx=K) / self.ng_cnt[:, None]
+        return E
 
     # ---------------------------------------------------------------- state
     def init_state(self, B, mem_len=None, ptr_len=None):
@@ -198,7 +231,8 @@ class PointerXL(nn.Module):
         Memories are fixed-size; n_mem / n_ptr (0-dim long tensors) count valid trailing slots."""
         c = self.cfg
         B, T = idx.shape
-        x = F.rms_norm(self.wte(idx), (c.d_model,))
+        E = self.emb_table()
+        x = F.rms_norm(F.embedding(idx, E), (c.d_model,))
         if self.training and c.type_dropout > 0:
             keep = (torch.rand(c.vocab_size) >= c.type_dropout).to(x.dtype)
             x = x * (keep[idx] / (1 - c.type_dropout)).unsqueeze(-1)
@@ -220,7 +254,7 @@ class PointerXL(nn.Module):
                 new_k.append(torch.cat([mk[i], k.detach()], dim=2)[:, :, -M:])
                 new_v.append(torch.cat([mv[i], v.detach()], dim=2)[:, :, -M:])
         h = self.nf(x)
-        z = F.linear(h * (self.logit_temp.exp() / math.sqrt(c.d_model)), self.wte.weight)
+        z = F.linear(h * (self.logit_temp.exp() / math.sqrt(c.d_model)), E)
         if c.softcap > 0:
             z = c.softcap * torch.tanh(z / c.softcap)
         nll_v = F.cross_entropy(z.float().reshape(-1, z.size(-1)), y.reshape(-1), reduction="none").view(B, T)
@@ -246,6 +280,8 @@ class PointerXL(nn.Module):
             new_py = Yc[:, -P:]
         if reduction == "none":
             return nll, new_k, new_v, new_pk, new_py
+        if reduction == "none_h":  # also expose final hidden states (kNN keys / queries)
+            return nll, new_k, new_v, new_pk, new_py, h
         loss = nll.mean()
         if pk is not None and c.ptr_aux > 0:
             loss = loss + c.ptr_aux * nll_v.mean()
@@ -254,7 +290,7 @@ class PointerXL(nn.Module):
     @staticmethod
     def advance(st, out, seg):
         """Carry memories forward after a segment of `seg` tokens."""
-        _, nk, nv, npk, npy = out
+        nk, nv, npk, npy = out[1], out[2], out[3], out[4]
         if st["mk"] is not None:
             st["mk"], st["mv"] = nk, nv
             st["n_mem"] = torch.clamp(st["n_mem"] + seg, max=st["mk"][0].size(2))
@@ -265,6 +301,14 @@ class PointerXL(nn.Module):
 
     @staticmethod
     def reset(st):
+        """New streams: invalidate and zero all memories (zeroing matters: the key-offset shift
+        would otherwise pull a stale memory key into the first key of the new segment)."""
         st["n_mem"] = torch.zeros((), dtype=torch.long)
         st["n_ptr"] = torch.zeros((), dtype=torch.long)
+        if st["mk"] is not None:
+            st["mk"] = [torch.zeros_like(t) for t in st["mk"]]
+            st["mv"] = [torch.zeros_like(t) for t in st["mv"]]
+        if st["pk"] is not None:
+            st["pk"] = torch.zeros_like(st["pk"])
+            st["py"] = torch.zeros_like(st["py"])
         return st

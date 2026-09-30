@@ -61,6 +61,9 @@ def get_args(argv=None):
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--log_every", type=int, default=25)
     ap.add_argument("--ckpt_every", type=float, default=900.0, help="seconds between resumable checkpoints")
+    ap.add_argument("--mg_eta", type=float, default=0.0,
+                    help="first-order meta-gradient: evaluate grads at theta - eta*g_prev/|g_prev| (MLP+attn mats)")
+    ap.add_argument("--mg_until", type=float, default=0.9, help="progress fraction after which meta-gradient is off")
     return ap.parse_args(argv)
 
 
@@ -143,6 +146,10 @@ def main(argv=None):
     test = torch.cat([torch.tensor([eos]), load(a.data, "test")])
     cfg = MemConfig(vocab_size=meta["vocab_size"], **{k: getattr(a, k) for k in asdict(MemConfig()) if k != "vocab_size"})
     model = PointerXL(cfg)
+    if cfg.compo_buckets:
+        from tokenizers import Tokenizer
+        tok = Tokenizer.from_file(os.path.join(a.data, "tokenizer.json"))
+        model.set_ngrams([tok.id_to_token(i) for i in range(cfg.vocab_size)])
     opts = build_optimizers(model, a)
     fwd = torch.compile(model) if a.compile else model
     g = torch.Generator().manual_seed(a.seed)
@@ -181,6 +188,8 @@ def main(argv=None):
                     "gen": g.get_state(), "rng": torch.get_rng_state(), "state": state}, tmp)
         os.replace(tmp, ck_path)
 
+    mg_params = [p for n_, p in model.named_parameters() if p.ndim == 2 and "wte" not in n_ and "compo" not in n_]
+    g_prev = None
     t0 = time.time() - elapsed0
     eval_time, last_ck = 0.0, time.time()
     tr_loss, n_log, tlast = 0.0, 0, time.time()
@@ -199,9 +208,21 @@ def main(argv=None):
         x, y, reset = sampler.next()
         if reset:
             state = model.reset(state)
+        use_mg = a.mg_eta > 0 and g_prev is not None and frac < a.mg_until
+        if use_mg:  # look-ahead along the previous segment's (normalised) gradient
+            with torch.no_grad():
+                torch._foreach_add_(mg_params, g_prev, alpha=-a.mg_eta * m)
         out = fwd(x, y, state["mk"], state["mv"], state["n_mem"], state["pk"], state["py"], state["n_ptr"])
         loss = out[0]
         loss.backward()
+        if use_mg:
+            with torch.no_grad():
+                torch._foreach_add_(mg_params, g_prev, alpha=a.mg_eta * m)
+        if a.mg_eta > 0:
+            with torch.no_grad():
+                gs = [p.grad if p.grad is not None else torch.zeros_like(p) for p in mg_params]
+                gn = torch.sqrt(sum((gg * gg).sum() for gg in gs)) + 1e-12
+                g_prev = [gg / gn for gg in gs]
         if a.clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip)
         for o in opts:

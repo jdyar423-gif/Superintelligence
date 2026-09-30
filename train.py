@@ -37,6 +37,10 @@ def get_args(argv=None):
     ap.add_argument("--muon_momentum", type=float, default=0.95)
     ap.add_argument("--mom_warmup", type=int, default=0, help="steps to warm Muon momentum 0.85->target")
     ap.add_argument("--cwd", type=int, default=0, help="cautious weight decay for Muon matrices")
+    ap.add_argument("--polar", type=int, default=0, help="Polar Express NS coefficients")
+    ap.add_argument("--normuon", type=int, default=0, help="NorMuon row normalisation")
+    ap.add_argument("--ctx_short", type=int, default=0, help="train at this shorter ctx first (0=off)")
+    ap.add_argument("--ctx_switch", type=float, default=0.7, help="progress fraction to switch to full ctx")
     ap.add_argument("--wd", type=float, default=0.1, help="decoupled weight decay for matrices")
     ap.add_argument("--emb_wd", type=float, default=0.0)
     ap.add_argument("--beta1", type=float, default=0.9)
@@ -94,10 +98,14 @@ class EpochSampler:
 
 
 @torch.no_grad()
-def eval_nll(model, stream, ctx, stride, batch=16, max_tokens=0):
+def eval_nll(model, stream, ctx, stride, batch=16, max_tokens=0, hidden_fn=None):
     """Sliding-window NLL. stream[0] is the <eos> context token; targets are stream[1:].
-    Returns (sum_nll_nats, n_targets)."""
-    model.eval()
+    Every target is scored exactly once, with up to ctx-1 tokens of context. The LM head is
+    only evaluated on rows that are scored. Returns (sum_nll_nats, n_targets)."""
+    base = getattr(model, "_orig_mod", model)
+    hidden_fn = hidden_fn or base.hidden
+    was_training = base.training
+    base.eval()
     if max_tokens:
         stream = stream[: max_tokens + 1]
     N = len(stream)
@@ -106,7 +114,6 @@ def eval_nll(model, stream, ctx, stride, batch=16, max_tokens=0):
     starts = list(range(0, n_tgt - ctx + 1, stride))
     if starts[-1] != n_tgt - ctx:
         starts.append(n_tgt - ctx)
-    # number of new targets scored by each window
     scored_end = 0
     jobs = []
     for s in starts:
@@ -117,15 +124,20 @@ def eval_nll(model, stream, ctx, stride, batch=16, max_tokens=0):
     ar = torch.arange(ctx + 1)
     for i in range(0, len(jobs), batch):
         chunk = jobs[i: i + batch]
-        idx = torch.tensor([s for s, _ in chunk])[:, None] + ar[None]
-        w = stream[idx]
+        st = [s for s, _ in chunk]
+        st = st + [st[-1]] * (batch - len(st))  # pad to a fixed shape (no recompiles)
+        w = stream[torch.tensor(st)[:, None] + ar[None]]
         x, y = w[:, :-1], w[:, 1:]
-        nll = model(x, y, reduction="none").view(len(chunk), ctx)
+        h = hidden_fn(x)
+        lo = min(off for _, off in chunk)
+        z = base.logits(h[: len(chunk), lo:]).float()
+        nll = F.cross_entropy(z.reshape(-1, z.size(-1)), y[: len(chunk), lo:].reshape(-1),
+                              reduction="none").view(len(chunk), -1)
         for j, (_, off) in enumerate(chunk):
-            total += nll[j, off:].sum().item()
+            total += nll[j, off - lo:].double().sum().item()
             count += ctx - off
     assert count == n_tgt, (count, n_tgt)
-    model.train()
+    base.train(was_training)
     return total, count
 
 
@@ -163,7 +175,8 @@ def build_optimizers(model, a):
         dict(params=scal, lr=a.lr, weight_decay=0.0),
     ]
     if a.opt == "muon":
-        opts.append(Muon(mats, lr=a.muon_lr, momentum=a.muon_momentum, weight_decay=a.wd, cautious_wd=a.cwd))
+        opts.append(Muon(mats, lr=a.muon_lr, momentum=a.muon_momentum, weight_decay=a.wd, cautious_wd=bool(a.cwd),
+                         polar=bool(a.polar), normuon=bool(a.normuon)))
     else:
         adam_groups.append(dict(params=mats, lr=a.lr, weight_decay=a.wd))
     opts.append(torch.optim.AdamW(adam_groups, betas=(a.beta1, a.beta2), eps=1e-8, foreach=True))
@@ -195,8 +208,12 @@ def main(argv=None):
 
     ema, swa, swa_n = None, None, 0
     g = torch.Generator().manual_seed(a.seed)
-    sampler = EpochSampler(train, a.ctx, a.batch, g)
+    if a.ctx_short:
+        sampler = EpochSampler(train, a.ctx_short, a.batch * a.ctx // a.ctx_short, g)
+    else:
+        sampler = EpochSampler(train, a.ctx, a.batch, g)
     tok_per_step = a.batch * a.ctx
+    hid_eval = torch.compile(model.hidden) if a.compile else model.hidden
     log = open(os.path.join(a.out, "log.txt"), "a")
     json.dump(vars(a), open(os.path.join(a.out, "args.json"), "w"), indent=1)
 
@@ -223,6 +240,11 @@ def main(argv=None):
                 if "momentum" in gr and a.mom_warmup:
                     f = min(1.0, step / a.mom_warmup)
                     gr["momentum"] = (1 - f) * 0.85 + f * a.muon_momentum
+        if a.ctx_short and sampler.T != a.ctx and frac >= a.ctx_switch:
+            ep = sampler.epoch
+            sampler = EpochSampler(train, a.ctx, a.batch, g)
+            sampler.epoch = ep
+            P(f"  switching to ctx {a.ctx} at step {step}")
         x, y = sampler.next()
         loss = fwd(x, y)
         loss.backward()
@@ -253,7 +275,7 @@ def main(argv=None):
             tr_loss, n_log, tlast = 0.0, 0, now
         if a.eval_every and step % a.eval_every == 0:
             te0 = time.time()
-            nll, n = eval_nll(fwd, val, a.ctx, a.ctx, max_tokens=a.eval_tokens)
+            nll, n = eval_nll(fwd, val, sampler.T, sampler.T, max_tokens=a.eval_tokens, hidden_fn=hid_eval)
             bpb = nll / n / math.log(2) / val_bytes_per_tok
             P(f"  eval step {step}: val_loss {nll/n:.4f} ~val_bpb(subset) {bpb:.4f}")
             eval_time += time.time() - te0
@@ -264,21 +286,32 @@ def main(argv=None):
     res = {"train_time": train_time, "steps": step, "epochs": step * tok_per_step / len(train),
            "params_nonemb": model.num_params(), "params_total": model.num_params(False)}
     te = time.time()
-    avg = swa if swa is not None else ema
-    if avg is not None:
-        # report the raw final weights too, then switch to the averaged weights
-        torch.save({"model": model.state_dict(), "cfg": asdict(cfg), "args": vars(a)}, os.path.join(a.out, "model_last.pt"))
-        nll, n = eval_nll(fwd, val, a.ctx, stride)
-        res["val_bpb_last"] = nll / math.log(2) / meta["validation"]["bytes"]
+    variants = {"last": [p.detach().clone() for p in model.parameters()]}
+    if ema is not None:
+        variants["ema"] = ema
+    if swa is not None:
+        variants["swa"] = swa
+    best_name, best_bpb = None, float("inf")
+    for name, ws in variants.items():
         with torch.no_grad():
-            for p, e in zip(model.parameters(), avg):
-                p.copy_(e)
+            for p, w in zip(model.parameters(), ws):
+                p.copy_(w)
+        torch.save({"model": model.state_dict(), "cfg": asdict(cfg), "args": vars(a)},
+                   os.path.join(a.out, f"model_{name}.pt"))
+        nll, n = eval_nll(fwd, val, a.ctx, stride, hidden_fn=hid_eval)
+        bpb = nll / math.log(2) / meta["validation"]["bytes"]
+        res[f"val_bpb_{name}"] = bpb
+        P(f"  final val bpb [{name}] {bpb:.4f}")
+        if bpb < best_bpb:
+            best_name, best_bpb = name, bpb
+    with torch.no_grad():
+        for p, w in zip(model.parameters(), variants[best_name]):
+            p.copy_(w)
     torch.save({"model": model.state_dict(), "cfg": asdict(cfg), "args": vars(a)}, os.path.join(a.out, "model.pt"))
-    nll, n = eval_nll(fwd, val, a.ctx, stride)
-    res["val_bpb"] = nll / math.log(2) / meta["validation"]["bytes"]
-    res["val_loss"] = nll / n
+    res["best"] = best_name
+    res["val_bpb"] = best_bpb
     if a.final_test:
-        nll, n = eval_nll(fwd, test, a.ctx, stride)
+        nll, n = eval_nll(fwd, test, a.ctx, stride, hidden_fn=hid_eval)
         res["test_bpb"] = nll / math.log(2) / meta["test"]["bytes"]
         res["test_loss"] = nll / n
     res["eval_time"] = time.time() - te
